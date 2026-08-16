@@ -197,6 +197,86 @@ def parse_day(page, ymd: str) -> list[dict]:
     return rows
 
 
+def probe() -> int:
+    """페이지가 실제로 뭘 돌려주는지 눈으로 확인. 차단인지 셀렉터 문제인지 가른다."""
+    ymd = datetime.now(KST).strftime("%Y%m%d")
+    url = f"{BOOKING_URL}?siteNo={SITE_NO}&siteNm={SITE_NM}&scnYmd={ymd}"
+    out = Path("probe")
+    out.mkdir(exist_ok=True)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=HEADLESS,
+            args=["--no-sandbox", "--disable-setuid-sandbox",
+                  "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+        )
+        ctx = browser.new_context(
+            user_agent=UA, locale="ko-KR", timezone_id="Asia/Seoul",
+            viewport={"width": 1440, "height": 900},
+        )
+        page = ctx.new_page()
+        log(f"조회 URL: {url}")
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+        page.wait_for_timeout(6000)  # SPA 렌더링 대기
+
+        status = resp.status if resp else None
+        server = (resp.header_value("server") or "-") if resp else "-"
+        cfray = (resp.header_value("cf-ray") or "-") if resp else "-"
+        log(f"HTTP {status} / server={server} / cf-ray={cfray}")
+        log(f"최종 URL: {page.url}")
+        log(f"제목: {page.title()!r}")
+
+        body = _clean(page.inner_text("body"))[:600]
+        log(f"본문 앞부분: {body!r}")
+
+        log("--- 셀렉터별 검출 개수 ---")
+        counts = {}
+        for name, sel in [("시간표 컨테이너", SEL_TIMETABLE), ("회차 항목", SEL_ITEM),
+                          ("영화 제목", SEL_TITLE), ("좌석/상영관", SEL_SEATWRAP),
+                          ("시작시각", SEL_START)]:
+            counts[name] = len(page.query_selector_all(sel))
+            log(f"  {name:12s} {sel:48s} → {counts[name]}개")
+
+        # 클래스명이 바뀌었는지 보려면 실제로 쓰인 클래스 접두사를 봐야 한다
+        prefixes = page.evaluate("""() => {
+            const s = new Set();
+            document.querySelectorAll('[class]').forEach(e => {
+                String(e.className).split(/\\s+/).forEach(c => {
+                    const m = c.match(/^([A-Za-z]+_[A-Za-z]+)__/);
+                    if (m) s.add(m[1]);
+                });
+            });
+            return [...s].sort().slice(0, 60);
+        }""")
+        log(f"페이지에 쓰인 CSS Module 접두사 {len(prefixes)}종: {prefixes}")
+
+        (out / "page.html").write_text(page.content(), encoding="utf-8")
+        page.screenshot(path=str(out / "page.png"), full_page=True)
+        log(f"probe/page.html, probe/page.png 저장 완료")
+
+        browser.close()
+
+    # 판정
+    log("=" * 50)
+    if status and status >= 400:
+        log(f"진단: HTTP {status}. 실브라우저도 막혔습니다. 한국 IP로 옮기세요.")
+        return 2
+    if not prefixes:
+        log("진단: CSS Module 클래스가 하나도 없습니다. CGV 화면이 아니라 차단/방어 페이지입니다.")
+        log("      → 한국 IP(내 PC, Oracle 서울)로 옮기세요.")
+        return 2
+    if counts.get("회차 항목", 0) > 0:
+        log("진단: 페이지도 셀렉터도 정상입니다. 회차가 0건이면 진짜로 편성이 없는 겁니다.")
+        return 0
+    if any(p.startswith("screenInfo") for p in prefixes):
+        log("진단: CGV 시간표 페이지는 받았는데 회차 항목만 안 잡힙니다. 셀렉터 이름이 바뀌었습니다.")
+        log(f"      → 위 접두사 목록에서 screenInfo 계열을 찾아 스크립트 상단 SEL_* 를 고치세요.")
+        return 1
+    log("진단: 페이지는 받았지만 시간표 영역 자체가 없습니다.")
+    log("      → probe/page.png 를 열어 어떤 화면인지 직접 확인하세요. 지역선택/점검 화면일 수 있습니다.")
+    return 1
+
+
 def matches_hall(row: dict) -> bool:
     pats = [p.strip().lower() for p in HALL_PATTERN.split("|") if p.strip()]
     hay = f"{row.get('hall', '')} {row.get('raw', '')}".lower()
@@ -314,6 +394,8 @@ def main() -> None:
     g.add_argument("--loop", action="store_true", help="주기적으로 계속 검사")
     g.add_argument("--debug", action="store_true", help="긁힌 회차를 전부 출력")
     g.add_argument("--test", action="store_true", help="디스코드 웹훅 발송 테스트")
+    g.add_argument("--probe", action="store_true",
+                   help="페이지 원본을 덤프해 차단인지 셀렉터 문제인지 진단")
     args = ap.parse_args()
 
     log(f"대상: CGV {SITE_NM}(siteNo={SITE_NO}) / 필터='{HALL_PATTERN}' / "
@@ -323,6 +405,9 @@ def main() -> None:
         ok = send_discord("✅ CGV 알리미 웹훅 연결 테스트입니다.")
         log("웹훅 정상" if ok else "웹훅 실패 - URL을 다시 확인하세요.")
         sys.exit(0 if ok else 1)
+
+    if args.probe:
+        sys.exit(probe())
 
     if args.debug:
         scan(debug=True)
