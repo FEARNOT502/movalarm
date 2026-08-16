@@ -59,14 +59,46 @@ BOOKING_URL = os.getenv("CGV_BOOKING_URL", "https://cgv.co.kr/cnm/movieBook/cine
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
-# CGV는 Next.js SPA라 클래스명이 `screenInfoTimes_startTimeItem__JW8_2` 처럼
+# CGV는 Next.js SPA라 클래스명이 `screenInfo_timeItem__A1b2` 처럼
 # 빌드마다 바뀌는 해시가 붙는다. 해시를 뺀 접두사로만 매칭해서 개편에 견디게 함.
+#
+# 2026-08 확인: 예전 `screenInfoTimes_*` 계열이 전부 사라지고 `screenInfo_*` 로 통합됐다.
+# 영화 제목이 회차 항목 바깥(영화 블록)에 있어서, 회차에서 조상으로 거슬러 올라가며 찾는다.
 SEL_TIMETABLE = '[class*="screenInfo_container"]'
-SEL_ITEM = '[class*="screenInfoTimes_startTimeItem"]'
-SEL_TITLE = '[class*="screenInfoTimes_title"]'
-SEL_SEATWRAP = '[class*="screenInfoTimes_seatWrap"]'
-SEL_START = '[class*="screenInfoTimes_startTime"]'
-SEL_END = '[class*="screenInfoTimes_endTime"]'
+SEL_ITEM = '[class*="screenInfo_timeItem"]'
+SEL_TITLE = '[class*="screenInfo_title"]'
+SEL_HALL = '[class*="screenInfo_theater"]'
+SEL_SEAT = '[class*="screenInfo_seat"]'
+SEL_START = '[class*="screenInfo_start"]'
+SEL_END = '[class*="screenInfo_end"]'
+
+# 회차 항목을 통째로 읽어오는 스크립트.
+# 제목은 회차 안에 있으면 그대로 쓰고, 없으면 조상 중 제목을 가진 가장 가까운 블록에서 가져온다.
+# 가장 가까운 조상을 쓰기 때문에 (영화 블록 > 전체 컨테이너) 다른 영화 제목을 집어오지 않는다.
+JS_EXTRACT = """
+() => {
+  const txt = e => e ? e.textContent.trim().replace(/\\s+/g, ' ') : '';
+  const pick = (root, frag) => txt(root.querySelector(`[class*="${frag}"]`));
+  return [...document.querySelectorAll('[class*="screenInfo_timeItem"]')].map(it => {
+    let movie = pick(it, 'screenInfo_title');
+    if (!movie) {
+      for (let p = it.parentElement; p && p !== document.body; p = p.parentElement) {
+        const t = p.querySelector('[class*="screenInfo_title"]');
+        if (t) { movie = txt(t); break; }
+      }
+    }
+    return {
+      movie,
+      start:  pick(it, 'screenInfo_start'),
+      end:    pick(it, 'screenInfo_end'),
+      seats:  pick(it, 'screenInfo_seat'),
+      hall:   pick(it, 'screenInfo_theater'),
+      status: pick(it, 'screenInfo_status'),
+      raw:    txt(it),
+    };
+  });
+}
+"""
 
 
 def log(msg: str) -> None:
@@ -150,40 +182,26 @@ def parse_day(page, ymd: str) -> list[dict]:
         return []  # 시간표 자체가 없음 = 아직 편성 안 됨 (정상 분기)
 
     page.wait_for_timeout(700)  # 렌더 안정화
+    # 목록이 길면 뒤쪽이 지연 렌더링될 수 있어 한 번 끝까지 내렸다 올린다
+    page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+    page.wait_for_timeout(500)
+    page.evaluate("() => window.scrollTo(0, 0)")
 
     rows: list[dict] = []
-    for item in page.query_selector_all(SEL_ITEM):
-        raw = _clean(item.inner_text())
+    for r in page.evaluate(JS_EXTRACT):
+        raw = _clean(r.get("raw"))
         if not raw:
             continue
 
-        def pick(sel: str) -> str:
-            el = item.query_selector(sel)
-            return _clean(el.inner_text()) if el else ""
+        movie = _clean(r.get("movie"))
+        start = _clean(r.get("start"))
+        end = re.sub(r"^[~\-–\s]+", "", _clean(r.get("end")))  # "- 13:05" / "~13:05" 정리
+        hall = _clean(r.get("hall"))
+        seats = _clean(r.get("seats"))
 
-        title = pick(SEL_TITLE)
-        start = pick(SEL_START)
-        end = pick(SEL_END).lstrip("~").strip()
-        seatwrap = pick(SEL_SEATWRAP)
-
-        # seatWrap 은 "480석 IMAX관" 처럼 잔여좌석 + 상영관명이 한 덩어리로 들어온다.
-        # 먼저 자식 span 을 따로 읽어보고, 안 되면 좌석 표기를 정규식으로 떼어낸다.
-        spans = [_clean(e.inner_text()) for e in item.query_selector_all(f"{SEL_SEATWRAP} > span")]
-        spans = [s for s in spans if s]
-        hall = ""
-        seats = ""
-        if len(spans) >= 2:
-            seats, hall = spans[0], spans[-1]
-        elif seatwrap:
-            m = re.match(r"\s*([\d,]+\s*석)\s*(.*)$", seatwrap)
-            if m:
-                seats, hall = m.group(1), m.group(2).strip()
-            else:
-                hall = seatwrap
-        hall = re.sub(r"^[\d,]+\s*석\s*", "", hall).strip()
-        # 구조 파싱이 실패하면 원문 텍스트로 폴백 (사이트 개편 대비)
-        if not title:
-            title = raw[:60]
+        # 구조 파싱이 어긋나도 알림 자체는 나가도록 원문에서 최소한을 건져낸다
+        if not movie:
+            movie = raw[:60]
         if not start:
             m = re.search(r"\b([0-2]?\d:[0-5]\d)\b", raw)
             start = m.group(1) if m else ""
@@ -191,8 +209,9 @@ def parse_day(page, ymd: str) -> list[dict]:
             hall = raw
 
         rows.append({
-            "date": ymd, "movie": title, "start": start, "end": end,
-            "hall": _clean(hall), "seats": seats, "raw": raw, "url": url,
+            "date": ymd, "movie": movie, "start": start, "end": end,
+            "hall": hall, "seats": seats, "status": _clean(r.get("status")),
+            "raw": raw, "url": url,
         })
     return rows
 
@@ -232,8 +251,8 @@ def probe() -> int:
         log("--- 셀렉터별 검출 개수 ---")
         counts = {}
         for name, sel in [("시간표 컨테이너", SEL_TIMETABLE), ("회차 항목", SEL_ITEM),
-                          ("영화 제목", SEL_TITLE), ("좌석/상영관", SEL_SEATWRAP),
-                          ("시작시각", SEL_START)]:
+                          ("영화 제목", SEL_TITLE), ("상영관", SEL_HALL),
+                          ("좌석", SEL_SEAT), ("시작시각", SEL_START)]:
             counts[name] = len(page.query_selector_all(sel))
             log(f"  {name:12s} {sel:48s} → {counts[name]}개")
 
@@ -249,6 +268,12 @@ def probe() -> int:
             return [...s].sort().slice(0, 60);
         }""")
         log(f"페이지에 쓰인 CSS Module 접두사 {len(prefixes)}종: {prefixes}")
+
+        sample = page.evaluate(JS_EXTRACT)
+        log(f"--- 실제 파싱 결과 {len(sample)}건 (앞 5건) ---")
+        for r in sample[:5]:
+            log(f"  {r['start']}~{r['end']} | {r['movie']} | 관={r['hall']} | "
+                f"좌석={r['seats']} | {r['status']}")
 
         (out / "page.html").write_text(page.content(), encoding="utf-8")
         page.screenshot(path=str(out / "page.png"), full_page=True)
