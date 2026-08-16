@@ -1,0 +1,119 @@
+name: CGV 센텀시티 IMAX 예매 오픈 알리미
+
+# cron 이 5분마다 정확히 돌아준다는 보장이 없어서(부하 시 10~30분 지연/누락),
+# "5분마다 워크플로를 띄우는" 대신 "한 번 뜬 워크플로가 5시간 35분 동안 5분마다 검사"한다.
+# GitHub-hosted job 한도가 6시간이라 그 안쪽으로 잡았다.
+#
+# 이어달리기 방식:
+#   - concurrency 그룹이 같으므로 실행 중에 트리거된 run 은 pending 으로 대기한다.
+#     (pending 은 항상 1개만 유지된다. 새 트리거가 오면 기존 pending 을 교체)
+#   - 매시 cron + 종료 직전 self-dispatch 로 pending 자리를 항상 채워둔다.
+#   - 그래서 현재 run 이 끝나는 즉시 대기 중이던 run 이 이어받는다. 공백은 셋업 1~2분.
+
+on:
+  schedule:
+    - cron: "0 * * * *"    # 이어달리기가 끊겼을 때를 대비한 안전망
+  workflow_dispatch: {}    # 수동 실행 + 종료 직전 자기 자신 재호출
+
+concurrency:
+  group: cgv-alarm
+  cancel-in-progress: false   # 실행 중인 감시를 죽이지 않고 뒤에서 대기
+
+permissions:
+  contents: write   # state.json 되커밋
+  actions: write    # 종료 직전 self-dispatch
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350      # 5시간 50분 (job 한도 6시간 아래)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Playwright 브라우저 캐시
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-v1
+
+      - name: 의존성 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: 연결 점검 (Cloudflare 차단 여부)
+        continue-on-error: true
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36" \
+            https://cgv.co.kr/ || echo 000)
+          echo "cgv.co.kr HTTP $code"
+          if [ "$code" = "403" ]; then
+            echo "::warning::Cloudflare 가 이 러너 IP를 차단하고 있을 수 있습니다. 아래 로그에서 '전체 0회차'가 계속 나오면 실행 위치를 옮기세요."
+          fi
+
+      - name: 5분 주기 감시 루프
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          CGV_SITE_NO: "0089"
+          CGV_SITE_NM: "센텀시티"
+          CGV_HALL_PATTERN: "IMAX"
+          CGV_HORIZON_DAYS: "14"
+          CGV_STOP_AFTER_EMPTY: "3"
+          CGV_STATE_PATH: "state.json"
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          END=$(( $(date +%s) + 20100 ))    # 5시간 35분
+          while [ "$(date +%s)" -lt "$END" ]; do
+            python cgv_alarm.py --once || echo "이번 회차 실패, 계속 진행"
+
+            # 새 회차를 알린 경우에만 state.json 이 바뀐다. 바뀌었을 때만 커밋
+            if [ -n "$(git status --porcelain state.json)" ]; then
+              git add state.json
+              git commit -m "chore: update state [skip ci]" || true
+              for i in 1 2 3; do
+                git push && break
+                git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+                sleep $(( i * 5 ))
+              done
+            fi
+
+            # 남은 시간이 한 주기도 안 되면 더 자지 말고 종료
+            [ $(( END - $(date +%s) )) -lt 300 ] && break
+            sleep 300
+          done
+
+      # 공개 저장소의 스케줄 워크플로는 저장소 활동이 60일간 없으면 자동 비활성화된다.
+      # 알림이 없는 동안에는 state.json 이 안 바뀌므로, 커밋 흔적을 따로 남겨 둔다.
+      - name: 하트비트 커밋
+        if: always()
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .heartbeat
+          if [ -n "$(git status --porcelain .heartbeat)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .heartbeat
+            git commit -m "chore: heartbeat [skip ci]" || true
+            for i in 1 2 3; do
+              git push && break
+              git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+              sleep $(( i * 5 ))
+            done
+          fi
+
+      - name: 다음 감시 실행 예약
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # GITHUB_TOKEN 으로 workflow_dispatch 를 호출하는 건 허용된다
+          # (2022-09-08 GitHub 변경사항에서 무한루프 방지 규칙의 예외로 명시)
+          gh workflow run "${GITHUB_WORKFLOW}" --ref "${GITHUB_REF_NAME}" || \
+            echo "self-dispatch 실패. 매시 cron 이 이어받습니다."
