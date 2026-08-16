@@ -1,7 +1,7 @@
 name: CGV 센텀시티 IMAX 예매 오픈 알리미
 
 # cron 이 짧은 주기로 정확히 돌아준다는 보장이 없어서(부하 시 10~30분 지연/누락),
-# "주기마다 워크플로를 띄우는" 대신 "한 번 뜬 워크플로가 5시간 35분 동안 PERIOD_SEC 마다 검사"한다.
+# "주기마다 워크플로를 띄우는" 대신 "한 번 뜬 워크플로가 5시간 35분 동안 CGV_INTERVAL_SEC 마다 검사"한다.
 # GitHub-hosted job 한도가 6시간이라 그 안쪽으로 잡았다.
 #
 # 이어달리기 방식:
@@ -60,8 +60,9 @@ jobs:
           CGV_STOP_AFTER_EMPTY: "3"
           CGV_STATE_PATH: "state.json"
           CGV_HEARTBEAT_SEC: "3600"        # 살아있음 신호 주기(초). 0이면 끔
-          PERIOD_SEC: "180"                # ★ 검사 주기(초). 여기만 바꾸면 됨 (3분)
-          MIN_SLEEP_SEC: "30"              # 스캔이 길어져도 최소 이만큼은 쉰다
+          # ★ 검사 주기(초). 여기만 바꾸면 됨. bash 루프와 파이썬 알림 문구가 같이 이 값을 쓴다
+          CGV_INTERVAL_SEC: "180"          # 3분
+          CGV_MIN_SLEEP_SEC: "30"          # 스캔이 길어져도 최소 이만큼은 쉰다
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -92,10 +93,10 @@ jobs:
             # 스캔에 쓴 시간을 빼야 설정한 주기가 실제 주기가 된다.
             # 고정으로 자면 (스캔시간 + 주기) 가 되어 설정값보다 한참 느려진다.
             ELAPSED=$(( $(date +%s) - T0 ))
-            SLEEP=$(( PERIOD_SEC - ELAPSED ))
-            if [ "$SLEEP" -lt "$MIN_SLEEP_SEC" ]; then
-              echo "스캔 ${ELAPSED}초 소요 → 주기(${PERIOD_SEC}초)를 이미 채움. ${MIN_SLEEP_SEC}초만 쉼"
-              SLEEP=$MIN_SLEEP_SEC
+            SLEEP=$(( CGV_INTERVAL_SEC - ELAPSED ))
+            if [ "$SLEEP" -lt "$CGV_MIN_SLEEP_SEC" ]; then
+              echo "스캔 ${ELAPSED}초 소요 → 주기(${CGV_INTERVAL_SEC}초)를 이미 채움. ${CGV_MIN_SLEEP_SEC}초만 쉼"
+              SLEEP=$CGV_MIN_SLEEP_SEC
             fi
 
             # 남은 시간이 한 주기도 안 되면 더 자지 말고 종료
