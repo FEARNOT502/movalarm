@@ -59,15 +59,23 @@ jobs:
           CGV_HORIZON_DAYS: "14"
           CGV_STOP_AFTER_EMPTY: "3"
           CGV_STATE_PATH: "state.json"
+          CGV_HEARTBEAT_SEC: "3600"        # 살아있음 신호 주기(초). 0이면 끔
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           END=$(( $(date +%s) + 20100 ))    # 5시간 35분
+          FIRST=1
           while [ "$(date +%s)" -lt "$END" ]; do
-            python cgv_alarm.py --once || echo "이번 회차 실패, 계속 진행"
+            # 이 run 의 첫 회차에서만 '감시 시작' 알림을 보낸다
+            if [ "$FIRST" = "1" ]; then
+              python cgv_alarm.py --once --announce-start || echo "이번 회차 실패, 계속 진행"
+              FIRST=0
+            else
+              python cgv_alarm.py --once || echo "이번 회차 실패, 계속 진행"
+            fi
 
-            # 새 회차를 알린 경우에만 state.json 이 바뀐다. 바뀌었을 때만 커밋
+            # 신규 회차를 알렸거나 하트비트를 보냈을 때만 state.json 이 바뀐다
             if [ -n "$(git status --porcelain state.json)" ]; then
               git add state.json
               git commit -m "chore: update state [skip ci]" || true
