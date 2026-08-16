@@ -1,0 +1,46 @@
+name: CGV 진단 (차단인지 셀렉터 문제인지 확인)
+
+# 수동 실행 전용. 실브라우저로 CGV 페이지를 한 번 열어보고
+# 실제로 뭐가 돌아오는지 HTML/스크린샷까지 남긴다.
+on:
+  workflow_dispatch:
+    inputs:
+      site_no:
+        description: "극장 코드 (센텀시티 0089 / 용산아이파크몰 0013)"
+        default: "0089"
+      site_nm:
+        description: "극장 이름"
+        default: "센텀시티"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 의존성 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: 페이지 진단
+        continue-on-error: true       # 진단 결과가 나쁘더라도 아티팩트는 올려야 한다
+        env:
+          CGV_SITE_NO: ${{ inputs.site_no }}
+          CGV_SITE_NM: ${{ inputs.site_nm }}
+        run: python cgv_alarm.py --probe
+
+      - name: 결과 파일 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cgv-probe
+          path: probe/
+          if-no-files-found: warn
+          retention-days: 7
