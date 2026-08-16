@@ -50,6 +50,10 @@ STATE_PATH = Path(os.getenv("CGV_STATE_PATH", "state.json"))
 # 살아있음 신호를 이 간격(초)마다 디스코드로 보낸다. 0이면 끄기. 기본 1시간
 HEARTBEAT_SEC = int(os.getenv("CGV_HEARTBEAT_SEC", "3600"))
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+# 디스코드 API 는 User-Agent 를 요구한다. 디스코드 문서 권장 형식: DiscordBot ($url, $version)
+DISCORD_UA = os.getenv(
+    "CGV_DISCORD_UA",
+    "DiscordBot (https://github.com/cgv-alarm, 1.0) cgv-alarm/1.0")
 HEADLESS = os.getenv("CGV_HEADLESS", "1") != "0"
 NAV_TIMEOUT = int(os.getenv("CGV_NAV_TIMEOUT_MS", "30000"))
 # 시간표가 안 뜨는 날짜는 이 시간만큼 기다린 뒤 '미편성'으로 넘긴다.
@@ -119,9 +123,12 @@ def send_discord(content: str) -> bool:
         "content": content[:1900],
         "allowed_mentions": {"parse": []},
     }).encode("utf-8")
+    # User-Agent 를 반드시 넣어야 한다. urllib 기본값인 "Python-urllib/3.x" 는
+    # 디스코드 앞단 Cloudflare 가 차단해서 403 (error code: 1010) 이 돌아온다.
     req = urllib.request.Request(
         DISCORD_WEBHOOK, data=payload,
-        headers={"Content-Type": "application/json"}, method="POST")
+        headers={"Content-Type": "application/json", "User-Agent": DISCORD_UA},
+        method="POST")
     for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=15) as r:
@@ -278,6 +285,18 @@ def probe() -> int:
             log(f"  {r['start']}~{r['end']} | {r['movie']} | 관={r['hall']} | "
                 f"좌석={r['seats']} | {r['status']}")
 
+        halls: dict[str, int] = {}
+        for r in sample:
+            halls[_clean(r.get("hall")) or "(없음)"] = halls.get(_clean(r.get("hall")) or "(없음)", 0) + 1
+        log(f"--- 이 날짜의 상영관 목록 {len(halls)}종 ---")
+        for h, n in sorted(halls.items(), key=lambda x: -x[1]):
+            mark = "  ← 필터 일치" if any(
+                p.strip().lower() in h.lower() for p in HALL_PATTERN.split("|") if p.strip()) else ""
+            log(f"  {n:3d}회차  {h}{mark}")
+        if not any(p.strip().lower() in " ".join(halls).lower()
+                   for p in HALL_PATTERN.split("|") if p.strip()):
+            log(f"  → 오늘은 '{HALL_PATTERN}' 편성이 없습니다. 다른 날짜는 --debug 로 확인하세요.")
+
         (out / "page.html").write_text(page.content(), encoding="utf-8")
         page.screenshot(path=str(out / "page.png"), full_page=True)
         log(f"probe/page.html, probe/page.png 저장 완료")
@@ -324,6 +343,7 @@ def scan(debug: bool = False, stats: dict | None = None) -> list[dict]:
     found: list[dict] = []
     st = stats if stats is not None else {}
     st.update({"total": 0, "days": 0, "errors": 0})
+    all_halls: dict[str, int] = {}
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=HEADLESS,
@@ -358,6 +378,9 @@ def scan(debug: bool = False, stats: dict | None = None) -> list[dict]:
 
                 hits = rows if debug else [r for r in rows if matches_hall(r)]
                 if debug:
+                    for r in rows:
+                        h = r.get("hall") or "(없음)"
+                        all_halls[h] = all_halls.get(h, 0) + 1
                     log(f"{ymd}: 전체 {len(rows)}회차 / {HALL_PATTERN} 매칭 "
                         f"{len([r for r in rows if matches_hall(r)])}건")
                     for r in rows[:8]:
@@ -371,6 +394,17 @@ def scan(debug: bool = False, stats: dict | None = None) -> list[dict]:
         finally:
             ctx.close()
             browser.close()
+
+    if debug and all_halls:
+        log("=" * 50)
+        log(f"조회 기간 전체 상영관 목록 {len(all_halls)}종")
+        pats = [p.strip().lower() for p in HALL_PATTERN.split("|") if p.strip()]
+        for h, n in sorted(all_halls.items(), key=lambda x: -x[1]):
+            mark = "  ← 필터 일치" if any(p in h.lower() for p in pats) else ""
+            log(f"  {n:4d}회차  {h}{mark}")
+        if not any(p in " ".join(all_halls).lower() for p in pats):
+            log(f"  → 조회 기간 안에 '{HALL_PATTERN}' 편성이 전혀 없습니다.")
+            log(f"     상영관 표기가 위 목록과 다르면 CGV_HALL_PATTERN 을 맞춰주세요.")
     return found
 
 
