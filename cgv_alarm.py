@@ -79,28 +79,53 @@ SEL_START = '[class*="screenInfo_start"]'
 SEL_END = '[class*="screenInfo_end"]'
 
 # 회차 항목을 통째로 읽어오는 스크립트.
-# 제목은 회차 안에 있으면 그대로 쓰고, 없으면 조상 중 제목을 가진 가장 가까운 블록에서 가져온다.
-# 가장 가까운 조상을 쓰기 때문에 (영화 블록 > 전체 컨테이너) 다른 영화 제목을 집어오지 않는다.
+#
+# CGV 는 [영화] > [상영 스펙 그룹] > [회차] 3단 구조다. 그런데 일반관과 특별관의
+# 마크업이 달라서, 회차 하나만 봐서는 상영관 이름을 알 수 없는 경우가 있다.
+#   - 일반관: 회차 안에 screenInfo_theater 가 있음        → "6관 (Laser)"
+#   - 특별관: 회차 안에는 시간/좌석뿐이고, 상영관은 위쪽
+#             스펙 줄에 있음                              → "IMAX관IMAX LASER 2D"
+# 그래서 회차 자신 + 스펙 줄 + 영화 블록을 각각 따로 잡고,
+# 필터링은 이 셋을 전부 이어붙인 match 문자열로 한다. 마크업이 또 바뀌어도
+# 상영관 이름이 어딘가에 남아 있으면 놓치지 않는다.
 JS_EXTRACT = """
 () => {
   const txt = e => e ? e.textContent.trim().replace(/\\s+/g, ' ') : '';
   const pick = (root, frag) => txt(root.querySelector(`[class*="${frag}"]`));
+
   return [...document.querySelectorAll('[class*="screenInfo_timeItem"]')].map(it => {
-    let movie = pick(it, 'screenInfo_title');
-    if (!movie) {
-      for (let p = it.parentElement; p && p !== document.body; p = p.parentElement) {
+    // 영화 블록: closest 로 잡으면 이 회차가 속한 영화만 정확히 걸린다
+    const wrap = it.closest('[class*="screenInfo_cinemaMovieWrap"]');
+    const movie = wrap ? pick(wrap, 'screenInfo_title') : '';
+
+    // 스펙 줄: 회차 안 → 없으면 영화 블록 아래 조상들에서 (영화 블록은 넘지 않는다)
+    let spec = pick(it, 'screenInfo_title');
+    if (!spec) {
+      for (let p = it.parentElement; p && p !== wrap && p !== document.body; p = p.parentElement) {
         const t = p.querySelector('[class*="screenInfo_title"]');
-        if (t) { movie = txt(t); break; }
+        if (t) { spec = txt(t); break; }
       }
     }
+    if (spec === movie) spec = '';
+
+    // 상영관: 회차 안 → 없으면 스펙 줄에 상영관 이름이 붙어 있다
+    let hall = pick(it, 'screenInfo_theater');
+    if (!hall && wrap) {
+      for (let p = it.parentElement; p && p !== wrap && p !== document.body; p = p.parentElement) {
+        const t = p.querySelector('[class*="screenInfo_theater"]');
+        if (t) { hall = txt(t); break; }
+      }
+    }
+    if (!hall) hall = spec;
+
+    const raw = txt(it);
     return {
-      movie,
+      movie, spec, hall, raw,
       start:  pick(it, 'screenInfo_start'),
       end:    pick(it, 'screenInfo_end'),
       seats:  pick(it, 'screenInfo_seat'),
-      hall:   pick(it, 'screenInfo_theater'),
       status: pick(it, 'screenInfo_status'),
-      raw:    txt(it),
+      match:  [movie, spec, hall, raw].join(' '),
     };
   });
 }
@@ -204,24 +229,30 @@ def parse_day(page, ymd: str) -> list[dict]:
             continue
 
         movie = _clean(r.get("movie"))
+        spec = _clean(r.get("spec"))
         start = _clean(r.get("start"))
         end = re.sub(r"^[~\-–\s]+", "", _clean(r.get("end")))  # "- 13:05" / "~13:05" 정리
         hall = _clean(r.get("hall"))
         seats = _clean(r.get("seats"))
 
+        # 상영관/좌석이 한 덩어리로 들어오는 날이 있어 시간·좌석 표기는 걷어낸다
+        hall = re.sub(r"\d{1,2}:\d{2}\s*[-~]?\s*\d{0,2}:?\d{0,2}", " ", hall)
+        hall = re.sub(r"(매진|\d[\d,]*\s*/\s*)?\d[\d,]*\s*석", " ", hall)
+        hall = _clean(re.sub(r"(매진|조조|심야|브런치)", " ", hall))
+
         # 구조 파싱이 어긋나도 알림 자체는 나가도록 원문에서 최소한을 건져낸다
         if not movie:
-            movie = raw[:60]
+            movie = spec or raw[:60]
         if not start:
             m = re.search(r"\b([0-2]?\d:[0-5]\d)\b", raw)
             start = m.group(1) if m else ""
         if not hall:
-            hall = raw
+            hall = spec or raw
 
         rows.append({
-            "date": ymd, "movie": movie, "start": start, "end": end,
+            "date": ymd, "movie": movie, "spec": spec, "start": start, "end": end,
             "hall": hall, "seats": seats, "status": _clean(r.get("status")),
-            "raw": raw, "url": url,
+            "raw": raw, "match": _clean(r.get("match")) or raw, "url": url,
         })
     return rows
 
@@ -279,11 +310,29 @@ def probe() -> int:
         }""")
         log(f"페이지에 쓰인 CSS Module 접두사 {len(prefixes)}종: {prefixes}")
 
+        # 구조가 또 바뀌었을 때 한 번에 파악하려고 회차 하나의 조상 사슬을 찍어둔다
+        outline = page.evaluate("""() => {
+          const it = document.querySelector('[class*="screenInfo_timeItem"]');
+          if (!it) return [];
+          const names = e => String(e.className).split(/\\s+/)
+              .map(c => (c.match(/^(.+?)__/) || [,c])[1]).join(',');
+          const out = [];
+          let d = 0;
+          for (let p = it; p && p !== document.body && d < 6; p = p.parentElement, d++) {
+            out.push(`${'  '.repeat(d)}<${p.tagName.toLowerCase()} ${names(p)}> `
+                     + p.textContent.trim().replace(/\\s+/g,' ').slice(0, 90));
+          }
+          return out;
+        }""")
+        log("--- 회차 하나의 조상 구조 (안쪽 → 바깥쪽) ---")
+        for line in outline:
+            log("  " + line)
+
         sample = page.evaluate(JS_EXTRACT)
         log(f"--- 실제 파싱 결과 {len(sample)}건 (앞 5건) ---")
         for r in sample[:5]:
-            log(f"  {r['start']}~{r['end']} | {r['movie']} | 관={r['hall']} | "
-                f"좌석={r['seats']} | {r['status']}")
+            log(f"  {r['start']}~{r['end']} | 영화={r['movie']} | 관={r['hall']} | "
+                f"스펙={r['spec']} | 좌석={r['seats']} | {r['status']}")
 
         halls: dict[str, int] = {}
         for r in sample:
@@ -325,8 +374,10 @@ def probe() -> int:
 
 
 def matches_hall(row: dict) -> bool:
+    """상영관 이름이 회차 안에 있을 때도, 위쪽 스펙 줄에만 있을 때도 잡히도록
+    movie/spec/hall/raw 를 전부 이어붙인 문자열에서 찾는다."""
     pats = [p.strip().lower() for p in HALL_PATTERN.split("|") if p.strip()]
-    hay = f"{row.get('hall', '')} {row.get('raw', '')}".lower()
+    hay = " ".join(str(row.get(k, "")) for k in ("match", "hall", "spec", "movie", "raw")).lower()
     return any(p in hay for p in pats)
 
 
@@ -384,7 +435,9 @@ def scan(debug: bool = False, stats: dict | None = None) -> list[dict]:
                     log(f"{ymd}: 전체 {len(rows)}회차 / {HALL_PATTERN} 매칭 "
                         f"{len([r for r in rows if matches_hall(r)])}건")
                     for r in rows[:8]:
-                        log(f"   · {r['start']} {r['movie']} | 관={r['hall']}")
+                        mk = " ★" if matches_hall(r) else ""
+                        log(f"   · {r['start']} [{r['hall']}] {r['movie']} "
+                            f"/ 스펙={r['spec']} / {r['seats']}{mk}")
                 elif hits:
                     log(f"{ymd}: {HALL_PATTERN} {len(hits)}회차 확인")
 
@@ -478,7 +531,7 @@ def check_once(announce_start: bool = False) -> int:
         for r in sorted(by_date[d], key=lambda x: x["start"]):
             tail = f" ~{r['end']}" if r["end"] else ""
             meta = " / ".join(x for x in (r["hall"], r.get("seats", "")) if x)
-            lines.append(f"  • `{r['start']}{tail}` {r['movie']}  ({meta})")
+            lines.append(f"  • `{r['start']}{tail}` **{r['movie']}**  ({meta})")
         lines.append("")
     lines.append(f"<{new[0]['url']}>")
     msg = "\n".join(lines)
