@@ -5,12 +5,20 @@ name: CGV 진단 (차단인지 셀렉터 문제인지 확인)
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "probe = 오늘 하루 정밀 진단 / debug = 기간 전체 상영관 목록"
+        type: choice
+        options: [probe, debug]
+        default: probe
       site_no:
         description: "극장 코드 (센텀시티 0089 / 용산아이파크몰 0013)"
         default: "0089"
       site_nm:
         description: "극장 이름"
         default: "센텀시티"
+      hall_pattern:
+        description: "상영관 필터 (예: IMAX, 4DX|SCREENX)"
+        default: "IMAX"
 
 jobs:
   probe:
@@ -34,7 +42,9 @@ jobs:
         env:
           CGV_SITE_NO: ${{ inputs.site_no }}
           CGV_SITE_NM: ${{ inputs.site_nm }}
-        run: python cgv_alarm.py --probe
+          CGV_HALL_PATTERN: ${{ inputs.hall_pattern }}
+          CGV_HORIZON_DAYS: "14"
+        run: python cgv_alarm.py --${{ inputs.mode }}
 
       - name: 결과 파일 업로드
         if: always()
