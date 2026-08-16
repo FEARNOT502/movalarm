@@ -46,16 +46,9 @@ jobs:
           pip install playwright
           playwright install --with-deps chromium
 
-      - name: 연결 점검 (Cloudflare 차단 여부)
-        continue-on-error: true
-        run: |
-          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 \
-            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36" \
-            https://cgv.co.kr/ || echo 000)
-          echo "cgv.co.kr HTTP $code"
-          if [ "$code" = "403" ]; then
-            echo "::warning::Cloudflare 가 이 러너 IP를 차단하고 있을 수 있습니다. 아래 로그에서 '전체 0회차'가 계속 나오면 실행 위치를 옮기세요."
-          fi
+      # curl 로 상태코드를 찍는 점검은 뺐다. Cloudflare 는 헤더보다 TLS ClientHello 를
+      # 먼저 보는데 curl 은 OpenSSL 이라 Chrome 과 지문이 달라 항상 403 이 나온다.
+      # 실제 크롤러는 Chromium 이라 결과가 다르므로, 판단은 cgv-probe 워크플로로 한다.
 
       - name: 5분 주기 감시 루프
         env:
