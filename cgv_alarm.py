@@ -46,6 +46,8 @@ HORIZON_DAYS = int(os.getenv("CGV_HORIZON_DAYS", "14"))   # 오늘부터 며칠 
 # CGV는 날짜를 연속 구간으로 여니까, 뒤쪽 빈 날짜까지 매번 긁을 이유가 없다. 0이면 끄기.
 STOP_AFTER_EMPTY = int(os.getenv("CGV_STOP_AFTER_EMPTY", "3"))
 INTERVAL_SEC = int(os.getenv("CGV_INTERVAL_SEC", "300"))  # --loop 주기 (기본 5분)
+# 스캔이 주기보다 오래 걸려도 최소 이만큼은 쉰다. 연속 요청으로 차단당하지 않기 위한 하한선
+MIN_SLEEP_SEC = int(os.getenv("CGV_MIN_SLEEP_SEC", "30"))
 STATE_PATH = Path(os.getenv("CGV_STATE_PATH", "state.json"))
 # 살아있음 신호를 이 간격(초)마다 디스코드로 보낸다. 0이면 끄기. 기본 1시간
 HEARTBEAT_SEC = int(os.getenv("CGV_HEARTBEAT_SEC", "3600"))
@@ -393,7 +395,8 @@ def scan(debug: bool = False, stats: dict | None = None) -> list[dict]:
     today = datetime.now(KST).date()
     found: list[dict] = []
     st = stats if stats is not None else {}
-    st.update({"total": 0, "days": 0, "errors": 0})
+    st.update({"total": 0, "days": 0, "errors": 0, "seconds": 0.0})
+    started = time.time()
     all_halls: dict[str, int] = {}
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -447,6 +450,7 @@ def scan(debug: bool = False, stats: dict | None = None) -> list[dict]:
         finally:
             ctx.close()
             browser.close()
+            st["seconds"] = time.time() - started
 
     if debug and all_halls:
         log("=" * 50)
@@ -504,6 +508,9 @@ def check_once(announce_start: bool = False) -> int:
             _heartbeat(state, rows, stats, "start")
         elif time.time() - last >= HEARTBEAT_SEC:
             _heartbeat(state, rows, stats, "hourly")
+
+    log(f"스캔 완료: {stats.get('days', 0)}일 / 전체 {stats.get('total', 0)}회차 "
+        f"/ {HALL_PATTERN} {len(rows)}회차 / {stats.get('seconds', 0):.0f}초")
 
     if not rows:
         log(f"{SITE_NM} {HALL_PATTERN} 편성 없음 (아직 오픈 전)")
@@ -577,6 +584,7 @@ def main() -> None:
     if args.loop:
         first = True
         while True:
+            t0 = time.time()
             try:
                 check_once(announce_start=first)
                 first = False
@@ -585,8 +593,15 @@ def main() -> None:
                 break
             except Exception as e:  # noqa: BLE001
                 log(f"검사 중 오류: {type(e).__name__}: {str(e)[:200]}")
-            wait = INTERVAL_SEC + random.uniform(-20, 20)
-            time.sleep(max(60, wait))
+            # 스캔에 쓴 시간을 빼야 설정한 주기가 실제 주기가 된다.
+            # 고정으로 자면 (스캔시간 + 주기) 가 되어 설정값보다 한참 느려진다.
+            elapsed = time.time() - t0
+            wait = INTERVAL_SEC - elapsed + random.uniform(-10, 10)
+            if wait < MIN_SLEEP_SEC:
+                log(f"스캔이 {elapsed:.0f}초 걸려 주기({INTERVAL_SEC}초)를 채웠습니다. "
+                    f"{MIN_SLEEP_SEC}초만 쉬고 계속합니다.")
+                wait = MIN_SLEEP_SEC
+            time.sleep(wait)
         sys.exit(0)
 
     check_once(announce_start=args.announce_start)
