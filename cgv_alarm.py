@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""
+CGV 특별관 예매 오픈 알리미
+- 기본 감시 대상: CGV 센텀시티(siteNo=0089) IMAX
+- 감지 기준: 해당 특별관에 없던 상영 회차가 새로 생기면 = 예매 오픈
+- 알림: 디스코드 웹훅
+
+실행 모드
+  python cgv_alarm.py --once   : 1회 검사 후 종료 (cron / GitHub Actions 용)
+  python cgv_alarm.py --loop   : 프로세스 상주하며 INTERVAL_SEC 마다 검사 (VM 용)
+  python cgv_alarm.py --debug  : 필터 없이 긁힌 회차를 전부 출력 (셀렉터 점검용)
+  python cgv_alarm.py --test   : 디스코드 웹훅 발송 테스트
+
+필요 패키지
+  pip install playwright && playwright install chromium
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from playwright.sync_api import TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
+
+# ----------------------------------------------------------------------------
+# 설정 (환경변수로 덮어쓸 수 있음)
+# ----------------------------------------------------------------------------
+KST = timezone(timedelta(hours=9))
+
+SITE_NO = os.getenv("CGV_SITE_NO", "0089")          # 센텀시티
+SITE_NM = os.getenv("CGV_SITE_NM", "센텀시티")
+# 회차의 상영관 표기에 이 문자열이 들어가면 대상으로 간주 (| 로 여러 개)
+HALL_PATTERN = os.getenv("CGV_HALL_PATTERN", "IMAX")
+HORIZON_DAYS = int(os.getenv("CGV_HORIZON_DAYS", "14"))   # 오늘부터 며칠 뒤까지 볼지
+# 상영이 하나도 없는 날짜가 이만큼 연속되면 예매 가능 범위 끝으로 보고 조회 중단.
+# CGV는 날짜를 연속 구간으로 여니까, 뒤쪽 빈 날짜까지 매번 긁을 이유가 없다. 0이면 끄기.
+STOP_AFTER_EMPTY = int(os.getenv("CGV_STOP_AFTER_EMPTY", "3"))
+INTERVAL_SEC = int(os.getenv("CGV_INTERVAL_SEC", "300"))  # --loop 주기 (기본 5분)
+STATE_PATH = Path(os.getenv("CGV_STATE_PATH", "state.json"))
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+HEADLESS = os.getenv("CGV_HEADLESS", "1") != "0"
+NAV_TIMEOUT = int(os.getenv("CGV_NAV_TIMEOUT_MS", "30000"))
+# 시간표가 안 뜨는 날짜는 이 시간만큼 기다린 뒤 '미편성'으로 넘긴다.
+# 빈 날짜가 곧 대기 시간이라 전체 한 바퀴 소요시간을 좌우한다. 너무 줄이면 오탐이 난다.
+WAIT_TABLE_MS = int(os.getenv("CGV_WAIT_TABLE_MS", "8000"))
+WAIT_ITEM_MS = int(os.getenv("CGV_WAIT_ITEM_MS", "3000"))
+
+BOOKING_URL = os.getenv("CGV_BOOKING_URL", "https://cgv.co.kr/cnm/movieBook/cinema")
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+
+# CGV는 Next.js SPA라 클래스명이 `screenInfoTimes_startTimeItem__JW8_2` 처럼
+# 빌드마다 바뀌는 해시가 붙는다. 해시를 뺀 접두사로만 매칭해서 개편에 견디게 함.
+SEL_TIMETABLE = '[class*="screenInfo_container"]'
+SEL_ITEM = '[class*="screenInfoTimes_startTimeItem"]'
+SEL_TITLE = '[class*="screenInfoTimes_title"]'
+SEL_SEATWRAP = '[class*="screenInfoTimes_seatWrap"]'
+SEL_START = '[class*="screenInfoTimes_startTime"]'
+SEL_END = '[class*="screenInfoTimes_endTime"]'
+
+
+def log(msg: str) -> None:
+    print(f"[{datetime.now(KST):%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+
+
+# ----------------------------------------------------------------------------
+# 디스코드 알림
+# ----------------------------------------------------------------------------
+def send_discord(content: str) -> bool:
+    if not DISCORD_WEBHOOK:
+        log("!! DISCORD_WEBHOOK_URL 이 비어 있어 알림을 못 보냅니다.")
+        return False
+    payload = json.dumps({
+        "username": "CGV 예매 알리미",
+        "content": content[:1900],
+        "allowed_mentions": {"parse": []},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        DISCORD_WEBHOOK, data=payload,
+        headers={"Content-Type": "application/json"}, method="POST")
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                if r.status in (200, 204):
+                    return True
+                log(f"디스코드 응답 코드 {r.status}")
+        except urllib.error.HTTPError as e:
+            body = e.read()[:200].decode("utf-8", "replace")
+            log(f"디스코드 HTTP {e.code}: {body}")
+            if e.code == 429:
+                time.sleep(5 * (attempt + 1))
+                continue
+            return False
+        except Exception as e:  # noqa: BLE001
+            log(f"디스코드 전송 실패({attempt + 1}/3): {e}")
+            time.sleep(3)
+    return False
+
+
+# ----------------------------------------------------------------------------
+# 상태 저장 (이미 알린 회차 기억)
+# ----------------------------------------------------------------------------
+def load_state() -> dict:
+    if not STATE_PATH.exists():
+        return {"seen": [], "bootstrapped": False}
+    try:
+        d = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        d.setdefault("seen", [])
+        d.setdefault("bootstrapped", False)
+        return d
+    except Exception as e:  # noqa: BLE001
+        log(f"상태 파일 손상, 새로 시작합니다: {e}")
+        return {"seen": [], "bootstrapped": False}
+
+
+def save_state(state: dict) -> None:
+    # 지난 회차가 무한정 쌓이지 않게 오늘 이전 날짜 키는 정리
+    today = datetime.now(KST).strftime("%Y%m%d")
+    state["seen"] = sorted({k for k in state["seen"] if k.split("|", 1)[0] >= today})
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------
+# 크롤링
+# ----------------------------------------------------------------------------
+def _clean(s: str | None) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def parse_day(page, ymd: str) -> list[dict]:
+    """해당 날짜의 모든 상영 회차를 긁어 리스트로 반환. 오픈 전이면 빈 리스트."""
+    url = f"{BOOKING_URL}?siteNo={SITE_NO}&siteNm={SITE_NM}&scnYmd={ymd}"
+    page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+
+    try:
+        page.wait_for_selector(SEL_TIMETABLE, timeout=WAIT_TABLE_MS)
+        page.wait_for_selector(SEL_ITEM, timeout=WAIT_ITEM_MS)
+    except PWTimeout:
+        return []  # 시간표 자체가 없음 = 아직 편성 안 됨 (정상 분기)
+
+    page.wait_for_timeout(700)  # 렌더 안정화
+
+    rows: list[dict] = []
+    for item in page.query_selector_all(SEL_ITEM):
+        raw = _clean(item.inner_text())
+        if not raw:
+            continue
+
+        def pick(sel: str) -> str:
+            el = item.query_selector(sel)
+            return _clean(el.inner_text()) if el else ""
+
+        title = pick(SEL_TITLE)
+        start = pick(SEL_START)
+        end = pick(SEL_END).lstrip("~").strip()
+        seatwrap = pick(SEL_SEATWRAP)
+
+        # seatWrap 은 "480석 IMAX관" 처럼 잔여좌석 + 상영관명이 한 덩어리로 들어온다.
+        # 먼저 자식 span 을 따로 읽어보고, 안 되면 좌석 표기를 정규식으로 떼어낸다.
+        spans = [_clean(e.inner_text()) for e in item.query_selector_all(f"{SEL_SEATWRAP} > span")]
+        spans = [s for s in spans if s]
+        hall = ""
+        seats = ""
+        if len(spans) >= 2:
+            seats, hall = spans[0], spans[-1]
+        elif seatwrap:
+            m = re.match(r"\s*([\d,]+\s*석)\s*(.*)$", seatwrap)
+            if m:
+                seats, hall = m.group(1), m.group(2).strip()
+            else:
+                hall = seatwrap
+        hall = re.sub(r"^[\d,]+\s*석\s*", "", hall).strip()
+        # 구조 파싱이 실패하면 원문 텍스트로 폴백 (사이트 개편 대비)
+        if not title:
+            title = raw[:60]
+        if not start:
+            m = re.search(r"\b([0-2]?\d:[0-5]\d)\b", raw)
+            start = m.group(1) if m else ""
+        if not hall:
+            hall = raw
+
+        rows.append({
+            "date": ymd, "movie": title, "start": start, "end": end,
+            "hall": _clean(hall), "seats": seats, "raw": raw, "url": url,
+        })
+    return rows
+
+
+def matches_hall(row: dict) -> bool:
+    pats = [p.strip().lower() for p in HALL_PATTERN.split("|") if p.strip()]
+    hay = f"{row.get('hall', '')} {row.get('raw', '')}".lower()
+    return any(p in hay for p in pats)
+
+
+def key_of(row: dict) -> str:
+    return f"{row['date']}|{row['movie']}|{row['start']}|{row['hall']}"
+
+
+def scan(debug: bool = False) -> list[dict]:
+    """감시 기간 전체를 훑어 대상 특별관 회차 목록을 반환."""
+    today = datetime.now(KST).date()
+    found: list[dict] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=HEADLESS,
+            args=["--no-sandbox", "--disable-setuid-sandbox",
+                  "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+        )
+        ctx = browser.new_context(
+            user_agent=UA, locale="ko-KR", timezone_id="Asia/Seoul",
+            viewport={"width": 1440, "height": 900},
+        )
+        page = ctx.new_page()
+        empty_streak = 0
+        try:
+            for i in range(HORIZON_DAYS):
+                ymd = (today + timedelta(days=i)).strftime("%Y%m%d")
+                try:
+                    rows = parse_day(page, ymd)
+                except Exception as e:  # noqa: BLE001
+                    log(f"{ymd} 조회 실패: {type(e).__name__}: {str(e)[:120]}")
+                    empty_streak = 0  # 오류는 '빈 날짜'와 다르니 카운트하지 않는다
+                    continue
+
+                # 어떤 상영관이든 회차가 0건이면 아직 예매 범위 밖
+                empty_streak = empty_streak + 1 if not rows else 0
+                if STOP_AFTER_EMPTY and empty_streak >= STOP_AFTER_EMPTY:
+                    log(f"{ymd}까지 빈 날짜 {empty_streak}일 연속 → 예매 범위 끝으로 보고 중단")
+                    break
+
+                hits = rows if debug else [r for r in rows if matches_hall(r)]
+                if debug:
+                    log(f"{ymd}: 전체 {len(rows)}회차 / {HALL_PATTERN} 매칭 "
+                        f"{len([r for r in rows if matches_hall(r)])}건")
+                    for r in rows[:8]:
+                        log(f"   · {r['start']} {r['movie']} | 관={r['hall']}")
+                elif hits:
+                    log(f"{ymd}: {HALL_PATTERN} {len(hits)}회차 확인")
+
+                found.extend(hits)
+                # 사람처럼 보이게 요청 간 간격을 조금씩 흔든다
+                time.sleep(random.uniform(0.8, 2.0))
+        finally:
+            ctx.close()
+            browser.close()
+    return found
+
+
+# ----------------------------------------------------------------------------
+# 1회 검사
+# ----------------------------------------------------------------------------
+def check_once() -> int:
+    state = load_state()
+    seen = set(state["seen"])
+    rows = scan()
+    new = [r for r in rows if key_of(r) not in seen]
+
+    if not rows:
+        log(f"{SITE_NM} {HALL_PATTERN} 편성 없음 (아직 오픈 전)")
+    if not new:
+        if rows:
+            log(f"신규 없음 (기존 {len(rows)}회차 유지)")
+        return 0
+
+    # 첫 실행은 기존 편성을 전부 '이미 본 것'으로 등록만 하고 알림은 생략
+    if not state["bootstrapped"]:
+        state["bootstrapped"] = True
+        state["seen"] = sorted(seen | {key_of(r) for r in new})
+        save_state(state)
+        log(f"첫 실행: 현재 {len(new)}회차를 기준선으로 저장했습니다. (알림 생략)")
+        return 0
+
+    by_date: dict[str, list[dict]] = {}
+    for r in new:
+        by_date.setdefault(r["date"], []).append(r)
+
+    lines = [f"🎬 **{SITE_NM} {HALL_PATTERN} 예매 오픈!**", ""]
+    for d in sorted(by_date):
+        pretty = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+        lines.append(f"__{pretty}__")
+        for r in sorted(by_date[d], key=lambda x: x["start"]):
+            tail = f" ~{r['end']}" if r["end"] else ""
+            meta = " / ".join(x for x in (r["hall"], r.get("seats", "")) if x)
+            lines.append(f"  • `{r['start']}{tail}` {r['movie']}  ({meta})")
+        lines.append("")
+    lines.append(f"<{new[0]['url']}>")
+    msg = "\n".join(lines)
+
+    print(msg)
+    if send_discord(msg):
+        log(f"디스코드 알림 발송 완료 (신규 {len(new)}회차)")
+        state["seen"] = sorted(seen | {key_of(r) for r in new})
+        save_state(state)
+    else:
+        log("알림 발송 실패 - 상태를 저장하지 않고 다음 검사에서 재시도합니다.")
+    return len(new)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="CGV 특별관 예매 오픈 알리미")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--once", action="store_true", help="1회 검사 후 종료")
+    g.add_argument("--loop", action="store_true", help="주기적으로 계속 검사")
+    g.add_argument("--debug", action="store_true", help="긁힌 회차를 전부 출력")
+    g.add_argument("--test", action="store_true", help="디스코드 웹훅 발송 테스트")
+    args = ap.parse_args()
+
+    log(f"대상: CGV {SITE_NM}(siteNo={SITE_NO}) / 필터='{HALL_PATTERN}' / "
+        f"{HORIZON_DAYS}일치 / 상태={STATE_PATH}")
+
+    if args.test:
+        ok = send_discord("✅ CGV 알리미 웹훅 연결 테스트입니다.")
+        log("웹훅 정상" if ok else "웹훅 실패 - URL을 다시 확인하세요.")
+        sys.exit(0 if ok else 1)
+
+    if args.debug:
+        scan(debug=True)
+        sys.exit(0)
+
+    if args.loop:
+        while True:
+            try:
+                check_once()
+            except KeyboardInterrupt:
+                log("종료합니다.")
+                break
+            except Exception as e:  # noqa: BLE001
+                log(f"검사 중 오류: {type(e).__name__}: {str(e)[:200]}")
+            wait = INTERVAL_SEC + random.uniform(-20, 20)
+            time.sleep(max(60, wait))
+        sys.exit(0)
+
+    check_once()
+
+
+if __name__ == "__main__":
+    main()
