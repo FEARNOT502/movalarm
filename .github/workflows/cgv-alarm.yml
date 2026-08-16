@@ -1,7 +1,7 @@
 name: CGV 센텀시티 IMAX 예매 오픈 알리미
 
-# cron 이 5분마다 정확히 돌아준다는 보장이 없어서(부하 시 10~30분 지연/누락),
-# "5분마다 워크플로를 띄우는" 대신 "한 번 뜬 워크플로가 5시간 35분 동안 5분마다 검사"한다.
+# cron 이 짧은 주기로 정확히 돌아준다는 보장이 없어서(부하 시 10~30분 지연/누락),
+# "주기마다 워크플로를 띄우는" 대신 "한 번 뜬 워크플로가 5시간 35분 동안 PERIOD_SEC 마다 검사"한다.
 # GitHub-hosted job 한도가 6시간이라 그 안쪽으로 잡았다.
 #
 # 이어달리기 방식:
@@ -50,7 +50,7 @@ jobs:
       # 먼저 보는데 curl 은 OpenSSL 이라 Chrome 과 지문이 달라 항상 403 이 나온다.
       # 실제 크롤러는 Chromium 이라 결과가 다르므로, 판단은 cgv-probe 워크플로로 한다.
 
-      - name: 5분 주기 감시 루프
+      - name: 주기 감시 루프
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           CGV_SITE_NO: "0089"
@@ -60,6 +60,8 @@ jobs:
           CGV_STOP_AFTER_EMPTY: "3"
           CGV_STATE_PATH: "state.json"
           CGV_HEARTBEAT_SEC: "3600"        # 살아있음 신호 주기(초). 0이면 끔
+          PERIOD_SEC: "180"                # ★ 검사 주기(초). 여기만 바꾸면 됨 (3분)
+          MIN_SLEEP_SEC: "30"              # 스캔이 길어져도 최소 이만큼은 쉰다
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -67,6 +69,7 @@ jobs:
           END=$(( $(date +%s) + 20100 ))    # 5시간 35분
           FIRST=1
           while [ "$(date +%s)" -lt "$END" ]; do
+            T0=$(date +%s)
             # 이 run 의 첫 회차에서만 '감시 시작' 알림을 보낸다
             if [ "$FIRST" = "1" ]; then
               python cgv_alarm.py --once --announce-start || echo "이번 회차 실패, 계속 진행"
@@ -86,9 +89,18 @@ jobs:
               done
             fi
 
+            # 스캔에 쓴 시간을 빼야 설정한 주기가 실제 주기가 된다.
+            # 고정으로 자면 (스캔시간 + 주기) 가 되어 설정값보다 한참 느려진다.
+            ELAPSED=$(( $(date +%s) - T0 ))
+            SLEEP=$(( PERIOD_SEC - ELAPSED ))
+            if [ "$SLEEP" -lt "$MIN_SLEEP_SEC" ]; then
+              echo "스캔 ${ELAPSED}초 소요 → 주기(${PERIOD_SEC}초)를 이미 채움. ${MIN_SLEEP_SEC}초만 쉼"
+              SLEEP=$MIN_SLEEP_SEC
+            fi
+
             # 남은 시간이 한 주기도 안 되면 더 자지 말고 종료
-            [ $(( END - $(date +%s) )) -lt 300 ] && break
-            sleep 300
+            [ $(( END - $(date +%s) )) -lt "$SLEEP" ] && break
+            sleep "$SLEEP"
           done
 
       # 공개 저장소의 스케줄 워크플로는 저장소 활동이 60일간 없으면 자동 비활성화된다.
