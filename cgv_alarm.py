@@ -47,6 +47,8 @@ HORIZON_DAYS = int(os.getenv("CGV_HORIZON_DAYS", "14"))   # 오늘부터 며칠 
 STOP_AFTER_EMPTY = int(os.getenv("CGV_STOP_AFTER_EMPTY", "3"))
 INTERVAL_SEC = int(os.getenv("CGV_INTERVAL_SEC", "300"))  # --loop 주기 (기본 5분)
 STATE_PATH = Path(os.getenv("CGV_STATE_PATH", "state.json"))
+# 살아있음 신호를 이 간격(초)마다 디스코드로 보낸다. 0이면 끄기. 기본 1시간
+HEARTBEAT_SEC = int(os.getenv("CGV_HEARTBEAT_SEC", "3600"))
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 HEADLESS = os.getenv("CGV_HEADLESS", "1") != "0"
 NAV_TIMEOUT = int(os.getenv("CGV_NAV_TIMEOUT_MS", "30000"))
@@ -143,16 +145,17 @@ def send_discord(content: str) -> bool:
 # 상태 저장 (이미 알린 회차 기억)
 # ----------------------------------------------------------------------------
 def load_state() -> dict:
+    blank = {"seen": [], "bootstrapped": False, "last_heartbeat": 0}
     if not STATE_PATH.exists():
-        return {"seen": [], "bootstrapped": False}
+        return dict(blank)
     try:
         d = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        d.setdefault("seen", [])
-        d.setdefault("bootstrapped", False)
+        for k, v in blank.items():
+            d.setdefault(k, v)
         return d
     except Exception as e:  # noqa: BLE001
         log(f"상태 파일 손상, 새로 시작합니다: {e}")
-        return {"seen": [], "bootstrapped": False}
+        return dict(blank)
 
 
 def save_state(state: dict) -> None:
@@ -312,10 +315,15 @@ def key_of(row: dict) -> str:
     return f"{row['date']}|{row['movie']}|{row['start']}|{row['hall']}"
 
 
-def scan(debug: bool = False) -> list[dict]:
-    """감시 기간 전체를 훑어 대상 특별관 회차 목록을 반환."""
+def scan(debug: bool = False, stats: dict | None = None) -> list[dict]:
+    """감시 기간 전체를 훑어 대상 특별관 회차 목록을 반환.
+
+    stats 를 넘기면 전체 회차 수/조회한 날짜 수/오류 수를 채워준다 (하트비트용).
+    """
     today = datetime.now(KST).date()
     found: list[dict] = []
+    st = stats if stats is not None else {}
+    st.update({"total": 0, "days": 0, "errors": 0})
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=HEADLESS,
@@ -336,7 +344,11 @@ def scan(debug: bool = False) -> list[dict]:
                 except Exception as e:  # noqa: BLE001
                     log(f"{ymd} 조회 실패: {type(e).__name__}: {str(e)[:120]}")
                     empty_streak = 0  # 오류는 '빈 날짜'와 다르니 카운트하지 않는다
+                    st["errors"] += 1
                     continue
+
+                st["days"] += 1
+                st["total"] += len(rows)
 
                 # 어떤 상영관이든 회차가 0건이면 아직 예매 범위 밖
                 empty_streak = empty_streak + 1 if not rows else 0
@@ -365,11 +377,46 @@ def scan(debug: bool = False) -> list[dict]:
 # ----------------------------------------------------------------------------
 # 1회 검사
 # ----------------------------------------------------------------------------
-def check_once() -> int:
+def _heartbeat(state: dict, rows: list[dict], stats: dict, kind: str) -> None:
+    """살아있다는 신호를 디스코드로 보낸다. kind: 'start' | 'hourly'"""
+    now = datetime.now(KST)
+    health = "정상" if stats.get("errors", 0) == 0 else f"오류 {stats['errors']}건"
+    body = (
+        f"CGV {SITE_NM} · 필터 `{HALL_PATTERN}`\n"
+        f"조회 {stats.get('days', 0)}일치 / 전체 {stats.get('total', 0)}회차 중 "
+        f"**{HALL_PATTERN} {len(rows)}회차**\n"
+        f"수집 상태: {health} · {now:%m-%d %H:%M} KST"
+    )
+    if kind == "start":
+        msg = f"🟢 **알리미 감시 시작**\n{body}\n{INTERVAL_SEC // 60}분마다 확인합니다."
+    else:
+        msg = f"🩺 **정상 작동 중**\n{body}"
+
+    if stats.get("days", 0) and stats.get("total", 0) == 0:
+        msg += "\n⚠️ 전체 회차가 0건입니다. 차단이거나 셀렉터가 어긋났을 수 있으니 `--probe`로 확인하세요."
+
+    if send_discord(msg):
+        state["last_heartbeat"] = int(time.time())
+        save_state(state)
+        log(f"하트비트 발송 ({kind})")
+    else:
+        log(f"하트비트 발송 실패 ({kind})")
+
+
+def check_once(announce_start: bool = False) -> int:
     state = load_state()
     seen = set(state["seen"])
-    rows = scan()
+    stats: dict = {}
+    rows = scan(stats=stats)
     new = [r for r in rows if key_of(r) not in seen]
+
+    # 살아있음 신호: 시작할 때 1회 + 이후 HEARTBEAT_SEC 마다
+    if HEARTBEAT_SEC > 0:
+        last = int(state.get("last_heartbeat", 0))
+        if announce_start:
+            _heartbeat(state, rows, stats, "start")
+        elif time.time() - last >= HEARTBEAT_SEC:
+            _heartbeat(state, rows, stats, "hourly")
 
     if not rows:
         log(f"{SITE_NM} {HALL_PATTERN} 편성 없음 (아직 오픈 전)")
@@ -421,6 +468,8 @@ def main() -> None:
     g.add_argument("--test", action="store_true", help="디스코드 웹훅 발송 테스트")
     g.add_argument("--probe", action="store_true",
                    help="페이지 원본을 덤프해 차단인지 셀렉터 문제인지 진단")
+    ap.add_argument("--announce-start", action="store_true",
+                    help="이번 실행에서 '감시 시작' 알림을 1회 보낸다")
     args = ap.parse_args()
 
     log(f"대상: CGV {SITE_NM}(siteNo={SITE_NO}) / 필터='{HALL_PATTERN}' / "
@@ -439,9 +488,11 @@ def main() -> None:
         sys.exit(0)
 
     if args.loop:
+        first = True
         while True:
             try:
-                check_once()
+                check_once(announce_start=first)
+                first = False
             except KeyboardInterrupt:
                 log("종료합니다.")
                 break
@@ -451,7 +502,7 @@ def main() -> None:
             time.sleep(max(60, wait))
         sys.exit(0)
 
-    check_once()
+    check_once(announce_start=args.announce_start)
 
 
 if __name__ == "__main__":
